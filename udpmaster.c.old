@@ -1,0 +1,269 @@
+/*	
+	
+	udp master node,reads settings from file, 
+	reads keys from file, sends them to however many nodes set
+	and waits for sorted keys and then the statistical packet
+	--------DATA FILE structure---------
+	<hostname> <port>
+
+	---------KEYS------------
+	<key> --- on in each line
+
+
+*/
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <string.h>
+#include <time.h>
+#include <stdlib.h>
+#define CONF_FILE	"data.txt"	/*contains node hostname and port, rename as needed */
+#define KEYS		"keys.txt"  /* contains keys to be sorted */
+#define OUT_FILE	"out.txt"
+#define num_of_procs	1		/*number of processors to send data to*/
+#define MAX				10		/*max number of keys */
+#define min_num		350		/*starting number */
+#define max_num		51000
+#define receive_port	4001
+
+ 
+typedef struct
+{
+	int nums[MAX];
+	char hostname[100];
+	int numofkeys;
+	int numofkeysrecvd ;
+	struct sockaddr_in pin;
+	struct hostent *hp;
+	time_t timeused;
+	int minrange;
+	int maxrange;
+} Bucket;
+
+typedef struct
+{
+	int numOfKeys;
+	time_t sorttime;
+} KeyData;
+
+int main()
+{
+	Bucket buckets[num_of_procs];
+	int sd;
+	int sd2;
+	FILE *inFP;
+	char hostname[20];
+	int portnum;
+	int i;
+	time_t totaltime;
+	int n = min_num;
+	for ( i = 0;i<num_of_procs;i++) /* initialize data */
+	{
+		buckets[i].numofkeys = 0;
+		buckets[i].numofkeysrecvd =0;
+		memset(buckets[i].hostname,0,sizeof(buckets[i].hostname));
+		buckets[i].minrange = n;
+		n = ((max_num-min_num)/num_of_procs*(i+1))+min_num;
+		if ( i == num_of_procs -1 )
+			buckets[i].maxrange = n+1;
+		else
+			buckets[i].maxrange = n;
+	}
+	
+
+	/* grab a socket */
+	if (( sd = socket(AF_INET, SOCK_DGRAM,0)) == -1 )
+	{
+		perror("socket");
+		exit(1);
+	}
+
+	/* read in and set data for each node */
+	inFP = fopen("data.txt","r");
+	printf("Reading %s for configuration details.\n",CONF_FILE);
+	for ( i = 0;i < num_of_procs; i++)
+	{
+		fscanf(inFP,"%s %d", hostname, &portnum);
+		strcpy(buckets[i].hostname,hostname);
+		if ((buckets[i].hp = gethostbyname(hostname)) == 0)
+		{
+			perror("gethostname");
+			exit(1);
+		}
+		memset(&buckets[i].pin,0,sizeof(buckets[i].pin));
+		buckets[i].pin.sin_family = AF_INET;
+		buckets[i].pin.sin_addr.s_addr = ((struct in_addr *) ( buckets[i].hp->h_addr)) -> s_addr;
+		buckets[i].pin.sin_port = htons(receive_port);
+	}
+
+
+
+	/****** read numbers ******/
+	FILE *keysFP;
+	int keynum;
+	keysFP = fopen("keys.txt","r");
+	while ( fscanf(keysFP,"%d",&keynum) != EOF)
+	{
+		 /* separate numbers into its buckets */
+		for ( i = 0; i<= num_of_procs;i++)
+		{
+			if ( buckets[i].minrange <= keynum && keynum < buckets[i].maxrange )
+			{
+				buckets[i].nums[buckets[i].numofkeys]= keynum;
+				buckets[i].numofkeys++;
+			}
+		}
+	}
+	int j;
+	if (( sd2 = socket(AF_INET, SOCK_DGRAM,0)) == -1 )
+	{
+		perror("socket");
+		exit(1);
+	}
+	for ( i = 0;i < num_of_procs; i++)
+	{
+		for( j = 0; i < buckets[i].numofkeys-1; i++) /* send data in each bucket to perspective node */
+		{
+			if (sendto(sd2,&buckets[i].nums[j],sizeof(int),0,(struct sockaddr *) &buckets[i].pin, sizeof(buckets[i].pin)) < 0 )
+			{
+				perror("sendto");
+				exit(1);
+			}
+			int tempint = -1;
+			sendto(sd2,&tempint,sizeof(int),0,(struct sockaddr *) &buckets[i].pin, sizeof(buckets[i].pin));
+		}
+	}
+
+	struct sockaddr_in sin;
+	struct timeval tv;
+	fd_set rfds;
+
+	memset(&sin,0,sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	sin.sin_port = htons(receive_port);
+
+	if (bind(sd,(struct sockaddr *) &sin,sizeof(sin)) == -1)
+	{
+		perror("bind");
+		exit(1);
+	}
+
+	int structlength = sizeof(sin);
+	int rc,recvd;
+	j = 0;
+	int j2 = 0;
+	while(1)
+	{
+		FD_ZERO(&rfds);
+		FD_SET(sd,&rfds);
+
+		tv.tv_sec = 0;
+		tv.tv_usec = 500000;
+
+		rc = select(FD_SETSIZE, &rfds, (fd_set *) NULL, (fd_set *) NULL, &tv);
+		if (rc == -1)
+		{
+			perror("select");
+			exit(1);
+		}
+		if (rc == 0)
+		{
+			printf("... Nothing Yet [%05d]...\n",j2++);
+			continue;
+		}
+
+		recvd = recvfrom(sd, &keynum, sizeof(int), 0, (struct sockaddr*) &sin, &structlength);
+		if ( recvd < 0 )
+		{
+			perror("recvfrom");
+			exit(1);
+		}
+
+		if ( recvd > 0 )
+		{
+			printf("Received something.");
+			if ( keynum == -1 ) /* if it is -1 wait for packet statistical packet */
+			{
+				struct sockaddr_in tempaddr;
+				tempaddr.sin_addr.s_addr = sin.sin_addr.s_addr;
+				int donerec = 1;
+				KeyData stats;
+				while(donerec) /* keep looping until it receives statistical packet */
+				{
+					int recvdstat;
+					recvdstat = recvfrom(sd, &stats, sizeof(KeyData), 0, (struct sockaddr*) &sin, &structlength);
+					if ( recvdstat  < 0 )
+					{
+						perror("recvdstat");
+						exit(1);
+					}
+					if ( recvdstat > 0  )
+					{	/* if received data is from node that is to send statistical packet process it */
+						if ( sin.sin_addr.s_addr == tempaddr.sin_addr.s_addr )
+						{
+							printf("received statistical packet.");
+							for ( i = 0; i < num_of_procs; i++)
+							{
+								if ( sin.sin_addr.s_addr == buckets[i].pin.sin_addr.s_addr )
+								{
+									buckets[i].numofkeysrecvd = stats.numOfKeys;
+									buckets[i].timeused = stats.sorttime;
+								}
+								char umsg[3] = "ACK";
+								if ( sendto(sd2,umsg,sizeof(umsg),0,(struct sockaddr *) &buckets[i].pin, sizeof(buckets[i].pin)) < 0 )
+								{
+									perror("sendto");
+									exit(1);
+								}
+								donerec = 0;
+							}
+						}
+						/*else
+						{
+							for ( i = 0; i < num_of_procs; i++)
+							{
+								if ( sin.sin_addr.s_addr == buckets[i].pin.sin_addr.s_addr )
+								{
+									buckets[i].nums[buckets[i].numofkeys] = keynum;
+									buckets[i].numofkeys++;
+								}
+							}
+							memset(&keynum,0,sizeof(int));
+						}*/
+					}
+				}
+			}
+			else /* otherise just insert key in correct spot */
+			{
+				for ( i = 0; i < num_of_procs; i++)
+				{
+					if ( sin.sin_addr.s_addr == buckets[i].pin.sin_addr.s_addr )
+					{
+						buckets[i].nums[buckets[i].numofkeys] = keynum;
+						buckets[i].numofkeys++;
+					}
+				}
+				memset(&keynum,0,sizeof(int));
+			}
+		}
+	}
+	FILE *outFP;
+	outFP = fopen(OUT_FILE,"w+");
+	
+	printf("PROC_ID		SORT_TIME	KEYS_RECEIVED	KEYS_SENT");
+	for ( i = 0; i<num_of_procs; i++) /* print data */
+	{
+		for ( j = 0;j < buckets[i].numofkeysrecvd; j++)
+		{
+			fprintf(outFP,"%d\n",buckets[i].nums[j]);
+			printf("  %d		%u		%d		%d\n",i,buckets[i].timeused,buckets[i].numofkeysrecvd,buckets[i].numofkeys);
+		}
+	}
+
+	close(sd);
+	sleep(1);
+	return 0;
+}
